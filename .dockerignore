@@ -1,0 +1,10 @@
+# Keep the build context small — the app image installs no code, so none of
+# this needs to be uploaded to the Docker daemon.
+.git
+node_modules
+vendor
+storage/logs/*
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+.env

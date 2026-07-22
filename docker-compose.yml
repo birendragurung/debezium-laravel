@@ -1,0 +1,215 @@
+name: debezium-cdc
+
+# End-to-end Change Data Capture pipeline:
+#   MySQL (source)  ->  Debezium (Kafka Connect)  ->  Kafka topics  ->  Kafka UI
+#
+# Bring it up:   docker compose up -d
+# Watch logs:    docker compose logs -f connect connector-init
+# Tear down:     docker compose down          (keep data volumes)
+#                docker compose down -v        (also wipe MySQL + Kafka data)
+
+services:
+  # ---------------------------------------------------------------------------
+  # Kafka broker (KRaft mode - no ZooKeeper needed). Single combined node.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: quay.io/debezium/kafka:3.6
+    container_name: dbz-kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"                        # broker (advertised as kafka:9092)
+    environment:
+      CLUSTER_ID: debezium_cluster
+      NODE_ID: 1
+      NODE_ROLE: combined                  # this node is both broker + controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+    volumes:
+      - kafka-data:/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks: [dbz]
+
+  # ---------------------------------------------------------------------------
+  # MySQL source database. Binary logging (row-based) is enabled via
+  # ./mysql/conf.d/cdc.cnf so Debezium can read the binlog. Schema + seed data
+  # and the "debezium" replication user are created by ./mysql/initdb/*.sql
+  # on first startup.
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: dbz-mysql
+    hostname: mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: debezium
+      MYSQL_DATABASE: inventory
+      MYSQL_USER: mysqluser
+      MYSQL_PASSWORD: mysqlpw
+    volumes:
+      - ./mysql/conf.d:/etc/mysql/conf.d:ro
+      - ./mysql/initdb:/docker-entrypoint-initdb.d:ro
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    networks: [dbz]
+
+  # ---------------------------------------------------------------------------
+  # Kafka Connect with the Debezium connectors pre-installed. Exposes the
+  # Connect REST API on :8083.
+  # ---------------------------------------------------------------------------
+  connect:
+    image: quay.io/debezium/connect:3.6
+    container_name: dbz-connect
+    hostname: connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      # Emit plain JSON (no schema envelope) so messages are easy to read.
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    networks: [dbz]
+
+  # ---------------------------------------------------------------------------
+  # One-shot helper: waits for Connect to be healthy, then POSTs the Debezium
+  # MySQL connector config. Exits when done. Safe to re-run (409 = already there).
+  # ---------------------------------------------------------------------------
+  connector-init:
+    image: curlimages/curl:8.10.1
+    container_name: dbz-connector-init
+    depends_on:
+      connect:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./connector/register-mysql.json:/register-mysql.json:ro
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        echo "Waiting for Kafka Connect REST API...";
+        until curl -sf -o /dev/null http://connect:8083/connectors; do sleep 3; done;
+        echo "Registering Debezium MySQL connector...";
+        code=$$(curl -s -o /tmp/resp -w "%{http_code}" -X POST \
+          -H "Accept:application/json" -H "Content-Type:application/json" \
+          http://connect:8083/connectors/ -d @/register-mysql.json);
+        echo "HTTP $$code"; cat /tmp/resp; echo;
+        if [ "$$code" = "409" ]; then echo "Connector already exists - OK"; fi;
+        echo "Registered connectors:"; curl -s http://connect:8083/connectors; echo;
+    restart: "no"
+    networks: [dbz]
+
+  # ---------------------------------------------------------------------------
+  # Redis. Used by the Laravel app for cache & sessions (see the `app` service).
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: dbz-redis
+    hostname: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks: [dbz]
+
+  # ---------------------------------------------------------------------------
+  # Laravel app (built from ./Dockerfile). Code is bind-mounted for live edits.
+  # Talks to the same MySQL `inventory` DB that Debezium streams, so writes made
+  # here flow through the CDC pipeline. -> http://localhost:8000
+  #
+  # DB/Redis env below override .env for in-network hostnames only; .env is
+  # otherwise untouched. Session & cache use Redis so the app boots without
+  # needing framework tables in MySQL.
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dbz-laravel
+    hostname: app
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: inventory
+      DB_USERNAME: root
+      DB_PASSWORD: debezium
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CACHE_STORE: redis
+      SESSION_DRIVER: redis
+    volumes:
+      - .:/var/www/html
+    command: >
+      sh -c "php artisan migrate --force &&
+             php artisan serve --host=0.0.0.0 --port=8000"
+    networks: [dbz]
+
+  # ---------------------------------------------------------------------------
+  # Web UI to browse topics, messages and connector status. -> http://localhost:8080
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: dbz-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: debezium
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+      DYNAMIC_CONFIG_ENABLED: "true"
+    networks: [dbz]
+
+volumes:
+  kafka-data:
+  mysql-data:
+  redis-data:
+
+networks:
+  dbz:
+    name: dbz-net

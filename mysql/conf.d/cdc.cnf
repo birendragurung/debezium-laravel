@@ -1,0 +1,16 @@
+# MySQL settings required for Debezium Change Data Capture.
+# Mounted read-only into /etc/mysql/conf.d/ and merged into the server config.
+[mysqld]
+# Every server in a replication topology needs a unique id. Debezium acts as a
+# replica, so the source just needs a stable non-zero id.
+server-id                   = 223344
+
+# Enable the binary log (Debezium tails this to capture row changes).
+log_bin                     = mysql-bin
+
+# Row-based logging with full before/after images is what Debezium requires.
+binlog_format               = ROW
+binlog_row_image            = FULL
+
+# Keep binlogs for 3 days so a restarted connector can resume.
+binlog_expire_logs_seconds  = 259200

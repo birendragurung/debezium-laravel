@@ -1,0 +1,11 @@
+{
+    "mcpServers": {
+        "laravel-boost": {
+            "command": "/Users/birendra/Library/Application Support/Herd/bin/php83",
+            "args": [
+                "/Users/birendra/Projects/learn/debezium/debezium-app/artisan",
+                "boost:mcp"
+            ]
+        }
+    }
+}

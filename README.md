@@ -58,6 +58,28 @@ docker compose exec mysql mysql -uroot -pdebezium inventory -e \
 Each event is a JSON envelope with `before`, `after`, `op`
 (`c`=create, `u`=update, `d`=delete, `r`=snapshot read) and `source` metadata.
 
+### Log changes to the activity log
+
+The Laravel `app` service consumes each table's topic and records every change
+as a [Spatie activity log](https://spatie.be/docs/laravel-activitylog) entry.
+Rebuild the image once so the rdkafka extension is available:
+
+```bash
+docker compose up -d --build app
+```
+
+Then run a per-table consumer (Ctrl-C to stop):
+
+```bash
+docker compose exec app php artisan cdc:consume:customers
+docker compose exec app php artisan cdc:consume:products
+docker compose exec app php artisan cdc:consume:orders
+```
+
+Each consumed event writes an `activity_log` row whose subject is the
+`Customer` / `Product` / `Order` record and whose properties hold the Debezium
+`before` / `after` / `op` payload.
+
 ## Useful commands
 
 ```bash

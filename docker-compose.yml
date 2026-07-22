@@ -179,6 +179,8 @@ services:
       REDIS_PORT: 6379
       CACHE_STORE: redis
       SESSION_DRIVER: redis
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CONSUMER_GROUP_ID: laravel-cdc
     volumes:
       - .:/var/www/html
     command: >

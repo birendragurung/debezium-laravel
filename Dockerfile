@@ -12,10 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libzip-dev \
       libicu-dev \
       libonig-dev \
+      librdkafka-dev \
       default-mysql-client \
     && docker-php-ext-install pdo_mysql bcmath zip intl \
-    && pecl install redis \
-    && docker-php-ext-enable redis \
+    && pecl install redis rdkafka \
+    && docker-php-ext-enable redis rdkafka \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

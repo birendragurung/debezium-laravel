@@ -1,10 +1,16 @@
 name: debezium-cdc
-
+# CDC -> Mysql/Postgres -> Debezium -> Kafka -> Listeners (Flink, Laravel app, Python etc.)
+# Mysql -> binlog , Postres (WAL)
+# Redis (AOL) -> In case of crashing, AOL (Append Only Log) is used to recover the data. Redis is used for caching and session management in the Laravel app.
 # End-to-end Change Data Capture pipeline:
 #   MySQL (source)  ->  Debezium (Kafka Connect)  ->  Kafka topics  ->  Kafka UI
+#                                                          |
+#                                                          ->  Flink (stream processing)
 #
 # Bring it up:   docker compose up -d
 # Watch logs:    docker compose logs -f connect connector-init
+#                docker compose logs -f jobmanager flink-job-submit
+# Flink UI:      http://localhost:8081
 # Tear down:     docker compose down          (keep data volumes)
 #                docker compose down -v        (also wipe MySQL + Kafka data)
 
@@ -124,6 +130,85 @@ services:
         echo "HTTP $$code"; cat /tmp/resp; echo;
         if [ "$$code" = "409" ]; then echo "Connector already exists - OK"; fi;
         echo "Registered connectors:"; curl -s http://connect:8083/connectors; echo;
+    restart: "no"
+    networks: [dbz]
+
+  # ---------------------------------------------------------------------------
+  # Flink JobManager. Runs stream-processing jobs on top of the Debezium
+  # topics (built from ./flink, which layers PyFlink + the Kafka SQL
+  # connector onto the official Flink image). Web UI -> http://localhost:8081
+  # ---------------------------------------------------------------------------
+  jobmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    container_name: dbz-flink-jobmanager
+    hostname: jobmanager
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+    volumes:
+      - ./flink/jobs:/opt/flink/jobs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+    networks: [dbz]
+
+  # ---------------------------------------------------------------------------
+  # Flink TaskManager. Executes the tasks that make up submitted jobs.
+  # ---------------------------------------------------------------------------
+  taskmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    container_name: dbz-flink-taskmanager
+    hostname: taskmanager
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2
+    volumes:
+      - ./flink/jobs:/opt/flink/jobs:ro
+    networks: [dbz]
+
+  # ---------------------------------------------------------------------------
+  # One-shot helper: waits for the Flink JobManager to be healthy, then
+  # submits the starter customer_order_stats job. Safe to re-run (submitting
+  # twice just starts a second instance of the job; cancel the old one first
+  # via the Web UI if that's not what you want).
+  # ---------------------------------------------------------------------------
+  flink-job-submit:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    container_name: dbz-flink-job-submit
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+      taskmanager:
+        condition: service_started
+    volumes:
+      - ./flink/jobs:/opt/flink/jobs:ro
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        echo "Submitting customer_order_stats job...";
+        flink run -d -m jobmanager:8081 -py /opt/flink/jobs/customer_order_stats.py;
     restart: "no"
     networks: [dbz]
 
